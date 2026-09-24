@@ -1,0 +1,13 @@
+PyQt6>=6.6.1
+PyQt6-Qt6>=6.6.1
+PyQt6-sip>=13.6.0
+requests>=2.31.0
+aiohttp>=3.9.0
+playwright>=1.40.0
+undetected-chromedriver>=3.5.0
+fake_useragent
+requests_auth_aws_sigv4
+python-dotenv
+moviepy<2
+yt_dlp
+setuptools

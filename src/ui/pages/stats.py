@@ -65,6 +65,7 @@ class StatCard(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
+        self.setMinimumWidth(112)
         layout.addWidget(make_label(title, "caption"))
         self.value = make_label("0")
         self.value.setObjectName("statValue")
@@ -78,10 +79,10 @@ class StatCard(QWidget):
             self.delta.setText(" ")
             set_role(self.delta, "caption")
         elif delta > 0:
-            self.delta.setText(f"+{fmt(delta)} с прошлого раза")
+            self.delta.setText(f"+{fmt(delta)}")
             set_role(self.delta, "ok")
         else:
-            self.delta.setText("без изменений")
+            self.delta.setText("0")
             set_role(self.delta, "caption")
 
 
@@ -119,7 +120,7 @@ class StatsPage(QWidget):
         root.addSpacing(24)
 
         cards = QHBoxLayout()
-        cards.setSpacing(40)
+        cards.setSpacing(28)
         self.card_plays = StatCard("Просмотры")
         self.card_likes = StatCard("Лайки")
         self.card_comments = StatCard("Комментарии")

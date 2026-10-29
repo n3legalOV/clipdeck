@@ -3,14 +3,16 @@ import time
 from datetime import datetime
 
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, QTableWidgetItem, QComboBox,
-                             QHeaderView, QAbstractItemView, QProgressBar, QMenu, QStackedLayout, QApplication)
+                             QHeaderView, QAbstractItemView, QProgressBar, QMenu, QStackedLayout, QApplication,
+                             QFileDialog)
 from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QAction
 
-from src.core.database import Database
+from src.app.services import ClipForgeService
 from src.core.paths import app_dir
 from src.core.stats_store import StatsStore
 from src.ui.components.common import PageHeader, make_button, make_label, set_role
+from src.ui.dialogs.styled_dialogs import show_info, show_warning
 from src.ui.styles import SUCCESS, DANGER, MUTED
 
 AUTO_OPTIONS = [("Выкл", 0), ("Каждые 15 минут", 15), ("Каждые 30 минут", 30), ("Каждый час", 60)]
@@ -87,9 +89,10 @@ class StatCard(QWidget):
 
 
 class StatsPage(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, service=None, parent=None):
         super().__init__(parent)
-        self.db = Database()
+        self.service = service or ClipForgeService()
+        self.db = self.service.db
         self.store = StatsStore(self.db)
         self.thread = None
         self.errors = {}
@@ -104,6 +107,7 @@ class StatsPage(QWidget):
         self.auto.setCurrentIndex(index)
         self.auto.blockSignals(False)
         self._apply_auto()
+        self.refresh()
 
     def _build(self):
         root = QVBoxLayout(self)
@@ -113,6 +117,9 @@ class StatsPage(QWidget):
         top = QHBoxLayout()
         self.header = PageHeader("Статистика", "")
         top.addWidget(self.header, 1)
+        self.btn_export = make_button("Экспорт CSV")
+        self.btn_export.clicked.connect(self._export)
+        top.addWidget(self.btn_export, 0, Qt.AlignmentFlag.AlignTop)
         self.btn_refresh = make_button("Обновить", "primary")
         self.btn_refresh.clicked.connect(self.refresh_all)
         top.addWidget(self.btn_refresh, 0, Qt.AlignmentFlag.AlignTop)
@@ -214,6 +221,7 @@ class StatsPage(QWidget):
         self.account_filter.setCurrentIndex(max(index, 0))
         self.account_filter.blockSignals(False)
         self.btn_refresh.setEnabled(bool(accounts) and not self._busy())
+        self.btn_export.setEnabled(bool(accounts))
         self.reload()
 
     def _busy(self):
@@ -223,7 +231,7 @@ class StatsPage(QWidget):
         selected = self.account_filter.currentData() or ALL
         accounts = self.store.latest_accounts()
         self.handles = {name: info["handle"] for name, info in accounts.items()}
-        videos = [v for v in self.store.latest_videos() if selected == ALL or v["username"] == selected]
+        videos = self.store.latest_videos(None if selected == ALL else selected)
 
         self.table.setSortingEnabled(False)
         self.table.setRowCount(0)
@@ -279,7 +287,9 @@ class StatsPage(QWidget):
         self.card_comments.set(total("comments"))
         self.card_shares.set(total("shares"))
         followers = sum(info["followers"] or 0 for name, info in accounts.items() if selected in (ALL, name))
-        self.card_followers.set(followers)
+        follower_delta = [info["d_followers"] for name, info in accounts.items()
+                          if selected in (ALL, name) and info["d_followers"] is not None]
+        self.card_followers.set(followers, sum(follower_delta) if follower_delta else None)
 
         last = self.store.last_fetch()
         self.header.set_subtitle(
@@ -340,6 +350,21 @@ class StatsPage(QWidget):
     def _auto_tick(self):
         if not self._busy():
             self.refresh_all()
+
+    def _export(self):
+        selected = self.account_filter.currentData() or ALL
+        default = f"clipforge-stats-{datetime.now().strftime('%Y-%m-%d')}.csv"
+        path, _ = QFileDialog.getSaveFileName(self, "Экспорт статистики", default, "CSV (*.csv)")
+        if not path:
+            return
+        if not path.lower().endswith(".csv"):
+            path += ".csv"
+        try:
+            count = self.store.export_csv(path, None if selected == ALL else selected)
+        except OSError as e:
+            show_warning(self, "Не удалось сохранить", str(e))
+            return
+        show_info(self, "Экспорт готов", f"Строк в файле: {count}.\n{path}")
 
     def _video_url(self, row):
         data = self.table.item(row, COL_ACCOUNT).data(Qt.ItemDataRole.UserRole)

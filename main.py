@@ -17,19 +17,49 @@ from src.core.app import Application
 
 def selftest():
     import shutil
-    lines = []
-    for name in ("tiktok_uploader.tiktok", "undetected_chromedriver", "moviepy.editor", "fake_useragent"):
+    lines = ["ClipForge self-test"]
+    for name in ("PyQt6.QtWidgets", "requests", "tiktok_uploader.tiktok", "tiktok_uploader.stats",
+                 "undetected_chromedriver", "fake_useragent"):
         try:
             __import__(name)
             lines.append(f"ok  {name}")
         except Exception as e:
             lines.append(f"ERR {name}: {e!r}")
-    js = app_dir() / "_internal" / "tiktok_uploader" / "tiktok-signature" / "browser.js"
-    lines.append(f"{'ok ' if js.exists() else 'ERR'} signer {js}")
-    stats_js = js.with_name("stats.js")
-    lines.append(f"{'ok ' if stats_js.exists() else 'ERR'} stats {stats_js}")
-    lines.append(f"{'ok ' if shutil.which('node') else 'ERR'} node {shutil.which('node')}")
-    (app_dir() / "selftest.log").write_text(chr(10).join(lines), encoding="utf-8")
+
+    signature = app_dir() / "_internal" / "tiktok_uploader" / "tiktok-signature"
+    if not signature.exists():
+        signature = app_dir() / "tiktok_uploader" / "tiktok-signature"
+    for name in ("browser.js", "stats.js"):
+        path = signature / name
+        lines.append(f"{'ok ' if path.exists() else 'ERR'} signer {path}")
+    modules = signature / "node_modules" / "playwright-chromium"
+    lines.append(f"{'ok ' if modules.exists() else 'ERR'} node_modules playwright-chromium в {signature}")
+
+    node = shutil.which("node")
+    lines.append(f"{'ok ' if node else 'ERR'} node {node}")
+    try:
+        from src.ui.dialogs.login import chrome_major_version
+        major = chrome_major_version()
+        lines.append(f"{'ok ' if major else 'ERR'} chrome {major or 'не найден'}")
+    except Exception as e:
+        lines.append(f"ERR chrome: {e!r}")
+
+    try:
+        from src.core.video_randomizer import resolve_ffmpeg
+        binary = resolve_ffmpeg()
+        lines.append(f"{'ok ' if binary else 'ERR'} ffmpeg {binary or 'не найден'}")
+    except Exception as e:
+        lines.append(f"ERR ffmpeg: {e!r}")
+
+    try:
+        from src.core.database import Database
+        db = Database()
+        db.set("selftest", "1")
+        lines.append(f"ok  database {app_dir() / 'data' / 'tiktok.db'}")
+    except Exception as e:
+        lines.append(f"ERR база данных: {e!r}")
+
+    (app_dir() / "selftest.log").write_text(chr(10).join(lines) + chr(10), encoding="utf-8")
 
 
 if __name__ == "__main__":

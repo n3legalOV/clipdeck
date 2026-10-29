@@ -5,6 +5,7 @@ from PyQt6.QtGui import QFont, QIcon
 from src.ui.windows.main import MainWindow
 from src.ui.styles import APP_STYLE
 from src.core.database import Database
+from src.app.services import ClipForgeService
 
 
 class Application:
@@ -16,8 +17,9 @@ class Application:
         self.app.setWindowIcon(QIcon(str(Path(__file__).resolve().parents[1] / "ui" / "assets" / "icon.png")))
         self.main_window = None
         self.db = Database()
+        self.service = ClipForgeService(self.db)
 
     def run(self):
-        self.main_window = MainWindow()
+        self.main_window = MainWindow(self.service)
         self.main_window.show()
         return self.app.exec()

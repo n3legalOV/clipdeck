@@ -1,14 +1,27 @@
 import requests, secrets, string, uuid, zlib, json, re, time, subprocess
-from requests_auth_aws_sigv4 import AWSSigV4
 
 
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 
-def subprocess_jsvmp(js, user_agent, url):
+def subprocess_jsvmp(js, user_agent, url, timeout=45):
 	flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
-	proc = subprocess.Popen(['node', js, url, user_agent], stdout=subprocess.PIPE, creationflags=flags)
-	return proc.stdout.read().decode('utf-8')
+	try:
+		proc = subprocess.Popen(['node', js, url, user_agent], stdout=subprocess.PIPE,
+		                        stderr=subprocess.PIPE, creationflags=flags)
+	except FileNotFoundError:
+		print("[-] Node.js не найден в PATH: подпись запросов недоступна")
+		return ""
+	try:
+		out, err = proc.communicate(timeout=timeout)
+	except subprocess.TimeoutExpired:
+		proc.kill()
+		print("[-] Генератор подписи не ответил вовремя")
+		return ""
+	text = out.decode('utf-8', 'replace').strip()
+	if not text and err:
+		print(f"[-] Ошибка генератора подписи: {err.decode('utf-8', 'replace').strip()[:300]}")
+	return text
 
 
 def generate_random_string(length, underline):
@@ -71,11 +84,16 @@ def convert_tags(text, session):
 				'authority': 'www.tiktok.com',
 				'accept': '*/*',
 				'accept-language': 'q=0.9,en-US;q=0.8,en;q=0.7,zh-CN;q=0.6,zh;q=0.5,vi;q=0.4',
-				'user-agent': user_agent
+				'user-agent': session.headers.get('User-Agent', user_agent)
 			}
 
-			r = session.request("GET", url, headers=headers)
-			user_id = r.text.split('webapp.user-detail":{"userInfo":{"user":{"id":"')[1].split('"')[0]
+			# Упоминание не должно срывать публикацию: если страницу профиля
+			# не удалось разобрать, оставляем текст как есть без user_id.
+			try:
+				r = session.request("GET", url, headers=headers, timeout=20)
+				user_id = r.text.split('webapp.user-detail":{"userInfo":{"user":{"id":"')[1].split('"')[0]
+			except Exception:
+				user_id = ""
 			text_extra.append(text_extra_block(end, end + len(match.group(2)) + 1, 0, "", user_id, str(i)))
 			end += len(match.group(2)) + 1
 			return "<m id=\"" + str(i) + "\">@" + match.group(2) + "</m>"

@@ -1,22 +1,66 @@
-import time, requests, datetime, hashlib, hmac, random, zlib, json, datetime
-import requests, zlib, json, time, subprocess, string, secrets, os, sys
-from fake_useragent import FakeUserAgentError, UserAgent
-from requests_auth_aws_sigv4 import AWSSigV4
+import json
+import os
+import random
+import subprocess
+import sys
+import time
+import uuid
+
+import requests
+try:
+	from requests_auth_aws_sigv4 import AWSSigV4
+except ImportError:  # пакет нужен только для самой загрузки, импорт модуля не должен падать
+	AWSSigV4 = None
+
+from tiktok_uploader import Config
+from tiktok_uploader.basics import eprint
+from tiktok_uploader.bot_utils import (
+    assertSuccess,
+    assert_success,
+    convert_tags,
+    crc32,
+    generate_random_string,
+    printError,
+    subprocess_jsvmp,
+)
 from tiktok_uploader.cookies import load_cookies_from_file
-from tiktok_uploader.Browser import Browser
-from tiktok_uploader.bot_utils import *
-from tiktok_uploader import Config, Video, eprint
-from dotenv import load_dotenv
+
+try:  # fake_useragent менял публичный API между версиями
+    from fake_useragent import FakeUserAgentError, UserAgent
+except Exception:  # pragma: no cover - зависит от установленной версии
+    UserAgent = None
+    FakeUserAgentError = Exception
 
 
 # Load environment variables
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except Exception:  # pragma: no cover
+    pass
 
 # Constants
-_UA = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/68.0.3440.106 Safari/537.36'
-
+_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
 
 REQUIRED_SESSION_COOKIE_NAMES = ("sessionid", "tt-target-idc")
+
+PUBLISH_ATTEMPTS = 3
+CHUNK_ATTEMPTS = 3
+
+
+class TikTokError(RuntimeError):
+	"""Ошибка публикации с понятным пользователю текстом."""
+
+
+def _random_user_agent():
+	if UserAgent is None:
+		return _UA
+	try:
+		return UserAgent().random
+	except Exception:
+		return _UA
+
 
 
 def wait_for_session_cookies(driver, poll_interval: float = 1.0, timeout: float = None):
@@ -63,6 +107,8 @@ def login(login_name: str):
 		print("Unnecessary login: session already saved!")
 		return session_cookie["value"]
 
+	from tiktok_uploader.Browser import Browser  # тяжёлая зависимость, только для входа
+
 	browser = Browser.get()
 	browser.driver.get(os.getenv("TIKTOK_LOGIN_URL"))
 
@@ -76,21 +122,28 @@ def login(login_name: str):
 	return session_cookie.get("value", "")
 
 
+def _ensure_ms_token(session):
+	"""TikTok кладёт msToken в куки при обычном заходе на сайт.
+	Без него запрос подписи и публикации отклоняется."""
+	if session.cookies.get("msToken"):
+		return session.cookies.get("msToken")
+	try:
+		session.get("https://www.tiktok.com/", timeout=30)
+	except requests.RequestException as e:
+		print(f"[WARNING] Не удалось получить msToken: {e}")
+	return session.cookies.get("msToken")
+
+
 # Local Code...
 def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, allow_duet=0, allow_stitch=0, visibility_type=0, brand_organic_type=0, branded_content_type=0, ai_label=0, proxy=None):
-	try:
-		user_agent = UserAgent().random
-	except FakeUserAgentError as e:
-		user_agent = _UA
-		print("[-] Could not get random user agent, using default")
+	user_agent = _random_user_agent()
 
 	cookies = load_cookies_from_file(f"tiktok_session-{session_user}")
 	session_id = next((c["value"] for c in cookies if c["name"] == 'sessionid'), None)
 	dc_id = next((c["value"] for c in cookies if c["name"] == 'tt-target-idc'), None)
 	
 	if not session_id:
-		eprint("No cookie with Tiktok session id found: use login to save session id")
-		sys.exit(1)
+		raise TikTokError("Нет сохранённой сессии TikTok: добавьте аккаунт заново")
 	if not dc_id:
 		print("[WARNING]: Please login, tiktok datacenter id must be allocated, or may fail")
 		dc_id = "useast2a"
@@ -108,6 +161,9 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 	if schedule_time != 0 and visibility_type == 1:
 		print("[-] Private videos cannot be uploaded with schedule")
 		return False
+
+	if not os.path.isfile(video):
+		raise TikTokError(f"Файл видео не найден: {video}")
 
 	# Check video length - 1 minute max, takes too long to run this.
 
@@ -131,6 +187,10 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 			"https": proxy
 		}
 
+	# msToken выдаётся только при заходе на сайт; без него подпись и запрос
+	# публикации уходят с msToken=None и TikTok отвечает отказом.
+	_ensure_ms_token(session)
+
 	creation_id = generate_random_string(21, True)
 	project_url = f"https://www.tiktok.com/api/v1/web/project/create/?creation_id={creation_id}&type=1&aid=1988"
 	r = session.post(project_url)
@@ -139,7 +199,11 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 		return False
 
 	# get project_id
-	project_id = r.json()["project"]["project_id"]
+	try:
+		project_id = r.json()["project"]["project_id"]
+	except (ValueError, KeyError):
+		raise TikTokError(f"TikTok не создал проект публикации (HTTP {r.status_code})")
+
 	video_id, session_key, upload_id, crcs, upload_host, store_uri, video_auth, aws_auth = upload_to_tiktok(video, session)
 
 	url = f"https://{upload_host}/{store_uri}?uploadID={upload_id}&phase=finish&uploadmode=part"
@@ -148,15 +212,9 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 		"Content-Type": "text/plain;charset=UTF-8",
 	}
 	data = ",".join([f"{i + 1}:{crcs[i]}" for i in range(len(crcs))])
-
-	if proxy:
-		r = requests.post(url, headers=headers, data=data, proxies=session.proxies)
-		if not assert_success(url, r):
-			return False
-	else:
-		r = requests.post(url, headers=headers, data=data)
-		if not assert_success(url, r):
-			return False
+	r = session.post(url, headers=headers, data=data)
+	if not assert_success(url, r):
+		return False
 	#
 	# url = f"https://www.tiktok.com/top/v1?Action=CommitUploadInner&Version=2020-11-19&SpaceName=tiktok"
 	# data = '{"SessionKey":"' + session_key + '","Functions":[{"name":"GetMeta"}]}'
@@ -317,23 +375,25 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 	if schedule_time > 0:
 		data["feature_common_info_list"][0]["schedule_time"] = schedule_time + int(time.time())
 	
-	uploaded = False
-	while True:
+	# Публикация с повторами: TikTok регулярно отвечает 429/5xx и просит
+	# повторить позже, а один аккаунт из группы не должен срывать остальные.
+	last_error = ""
+	for attempt in range(1, PUBLISH_ATTEMPTS + 1):
 		mstoken = session.cookies.get("msToken")
-		# xbogus = subprocess_jsvmp(os.path.join(os.getcwd(), "tiktok_uploader", "./x-bogus.js"), user_agent, f"app_name=tiktok_web&channel=tiktok_web&device_platform=web&aid=1988&msToken={mstoken}")
-		# /tiktok/web/project/post/v1/
 		js_path = os.path.join(os.path.dirname(__file__), "tiktok-signature", "browser.js")
 		sig_url = f"https://www.tiktok.com/api/v1/web/project/post/?app_name=tiktok_web&channel=tiktok_web&device_platform=web&aid=1988&msToken={mstoken}"
 		signatures = subprocess_jsvmp(js_path, user_agent, sig_url)
-		if signatures is None:
-			print("[-] Failed to generate signatures")
-			return False
+		if not signatures:
+			last_error = "генератор подписи не ответил (нужен Node.js)"
+			print(f"[-] {last_error}")
+			break
 
 		try:
 			tt_output = json.loads(signatures)["data"]
-		except (json.JSONDecodeError, KeyError) as e:
-			print(f"[-] Failed to parse signature data: {str(e)}")
-			return False
+		except (json.JSONDecodeError, KeyError, TypeError) as e:
+			last_error = f"не удалось разобрать подпись: {e}"
+			print(f"[-] {last_error}")
+			break
 
 		project_post_dict = {
 			"app_name": "tiktok_web",
@@ -346,36 +406,38 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 			# "X-TT-Params": tt_output["x-tt-params"],  # not needed rn.
 		}
 
-		# url = f"https://www.tiktok.com/api/v1/web/project/post/"
 		url = f"https://www.tiktok.com/tiktok/web/project/post/v1/"
-		r = session.request("POST", url, params=project_post_dict, data=json.dumps(data), headers=headers)
-		if not assertSuccess(url, r):
-			print("[-] Published failed, try later again")
-			printError(url, r)
-			return False
-
-		if r.json()["status_code"] == 0:
-			print(f"Published successfully {'| Scheduled for ' + str(schedule_time) if schedule_time else ''}")
-			uploaded = True
-			break
+		try:
+			r = session.request("POST", url, params=project_post_dict, data=json.dumps(data), headers=headers)
+		except requests.RequestException as e:
+			last_error = f"сеть: {type(e).__name__}"
+			print(f"[-] {last_error}")
 		else:
-			print("[-] Publish failed to Tiktok, trying again...")
-			printError(url, r)
-			return False
-		#
-		# try:
-		# 	if r.json()["status_msg"] == "You are posting too fast. Take a rest.":
-		# 		print("[-] You are posting too fast, try later again")
-		# 		return False
-		# 	print(r.json())
-		# 	uploaded = True
-		# 	break
-		# except Exception as e:
-		# 	print("[-] Waiting for TikTok to process video...")
-		# 	time.sleep(1.5)  # wait 1.5 seconds before asking again.
+			if r.status_code == 200:
+				try:
+					status_code = r.json()["status_code"]
+				except (ValueError, KeyError):
+					status_code = None
+				if status_code == 0:
+					print(f"Published successfully {'| Scheduled for ' + str(schedule_time) if schedule_time else ''}")
+					uploaded = True
+					break
+				last_error = _post_error_message(r)
+				print(f"[-] {last_error}")
+				printError(url, r)
+			else:
+				last_error = _post_error_message(r)
+				print(f"[-] {last_error} (HTTP {r.status_code})")
+				printError(url, r)
+
+		if attempt < PUBLISH_ATTEMPTS:
+			delay = 5 * attempt + random.uniform(0, 3)
+			print(f"[-] Повтор через {delay:.0f} с (попытка {attempt + 1}/{PUBLISH_ATTEMPTS})")
+			time.sleep(delay)
+
 	if not uploaded:
-		print("[-] Could not upload video")
-		return False
+		raise TikTokError(last_error or "TikTok не принял публикацию")
+	return True
 	# Check if video uploaded successfully (Tiktok has changed endpoint for this)
 	# url = f"https://www.tiktok.com/api/v1/web/project/list/?aid=1988"
 	#
@@ -396,19 +458,44 @@ def upload_video(session_user, video, title, schedule_time=0, allow_comment=1, a
 	# 		print("Response ", j)
 
 
+def _post_error_message(response):
+	"""Переводит ответ TikTok в текст, который поймёт пользователь."""
+	try:
+		payload = response.json()
+	except ValueError:
+		return f"TikTok ответил HTTP {response.status_code}"
+	message = str(payload.get("status_msg") or payload.get("message") or "").strip()
+	code = payload.get("status_code")
+	lowered = message.lower()
+	if "too fast" in lowered or response.status_code == 429:
+		return "TikTok: слишком частые публикации, попробуйте позже"
+	if code == 10201 or "login" in lowered:
+		return "сессия недействительна, войдите в аккаунт заново"
+	detail = f"код {code}" if code is not None else f"HTTP {response.status_code}"
+	if message:
+		detail += f": {message[:200]}"
+	return f"TikTok отклонил публикацию ({detail})"
+
+
 def upload_to_tiktok(video_file, session):
 	url = "https://www.tiktok.com/api/v1/video/upload/auth/?aid=1988"
 	r = session.get(url)
 	if not assert_success(url, r):
-		return False
+		raise TikTokError(f"TikTok не выдал токен загрузки (HTTP {r.status_code})")
 
-	aws_auth = AWSSigV4(
-		"vod",
-		region="ap-singapore-1",
-		aws_access_key_id=r.json()["video_token_v5"]["access_key_id"],
-		aws_secret_access_key=r.json()["video_token_v5"]["secret_acess_key"],
-		aws_session_token=r.json()["video_token_v5"]["session_token"],
-	)
+	try:
+		token = r.json()["video_token_v5"]
+		if AWSSigV4 is None:
+			raise TikTokError("Не установлен пакет requests_auth_aws_sigv4 — нужен для загрузки видео")
+		aws_auth = AWSSigV4(
+			"vod",
+			region="ap-singapore-1",
+			aws_access_key_id=token["access_key_id"],
+			aws_secret_access_key=token["secret_acess_key"],
+			aws_session_token=token["session_token"],
+		)
+	except (ValueError, KeyError, TypeError) as e:
+		raise TikTokError(f"Некорректный ответ TikTok при загрузке: {type(e).__name__}")
 	# Accept either an absolute/existing path OR a filename relative to the
 	# configured videos_dir. The API passes absolute paths for uploads that
 	# weren't first dropped into VideosDirPath/.
@@ -416,22 +503,30 @@ def upload_to_tiktok(video_file, session):
 		video_path = video_file
 	else:
 		video_path = os.path.join(os.getcwd(), Config.get().videos_dir, video_file)
+	if not os.path.isfile(video_path):
+		raise TikTokError(f"Файл видео не найден: {video_path}")
 	with open(video_path, "rb") as f:
 		video_content = f.read()
 	file_size = len(video_content)
+	if file_size == 0:
+		raise TikTokError("Файл видео пустой")
 	url = f"https://www.tiktok.com/top/v1?Action=ApplyUploadInner&Version=2020-11-19&SpaceName=tiktok&FileType=video&IsInner=1&FileSize={file_size}&s=g158iqx8434"
 
 	r = session.get(url, auth=aws_auth)
 	if not assert_success(url, r):
-		return False
+		raise TikTokError(f"TikTok не принял файл ({len(video_content)} байт, HTTP {r.status_code})")
 
 	# upload chunks
-	upload_node = r.json()["Result"]["InnerUploadAddress"]["UploadNodes"][0]
-	video_id = upload_node["Vid"]
-	store_uri = upload_node["StoreInfos"][0]["StoreUri"]
-	video_auth = upload_node["StoreInfos"][0]["Auth"]
-	upload_host = upload_node["UploadHost"]
-	session_key = upload_node["SessionKey"]
+	try:
+		upload_node = r.json()["Result"]["InnerUploadAddress"]["UploadNodes"][0]
+		video_id = upload_node["Vid"]
+		store_uri = upload_node["StoreInfos"][0]["StoreUri"]
+		video_auth = upload_node["StoreInfos"][0]["Auth"]
+		upload_host = upload_node["UploadHost"]
+		session_key = upload_node["SessionKey"]
+	except (ValueError, KeyError, IndexError, TypeError):
+		raise TikTokError("TikTok вернул неожиданный ответ на запрос места для загрузки")
+
 	chunk_size = 5242880
 	chunks = []
 	i = 0
@@ -452,11 +547,26 @@ def upload_to_tiktok(video_file, session):
 			"Content-Crc32": crc,
 		}
 
-		r = session.post(url, headers=headers, data=chunk)
-		if r.status_code != 200:
-			print(f"[-] Chunk {i + 1}/{len(chunks)} failed: {r.status_code} {r.text[:300]}")
+		# Каждый кусок повторяем: без этого битый кусок проходил молча и
+		# TikTok потом отклонял всю публикацию.
+		last_status = None
+		for attempt in range(1, CHUNK_ATTEMPTS + 1):
+			try:
+				r = session.post(url, headers=headers, data=chunk)
+			except requests.RequestException as e:
+				last_status = f"сеть: {type(e).__name__}"
+			else:
+				if r.status_code == 200:
+					last_status = None
+					break
+				last_status = f"HTTP {r.status_code}: {r.text[:200]}"
+			if attempt < CHUNK_ATTEMPTS:
+				time.sleep(attempt * 2)
+		if last_status is not None:
+			raise TikTokError(f"Не удалось загрузить часть {i + 1}/{len(chunks)} ({last_status})")
 
 	return video_id, session_key, upload_id, crcs, upload_host, store_uri, video_auth, aws_auth
+
 
 
 

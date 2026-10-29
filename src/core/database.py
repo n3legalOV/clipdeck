@@ -1,25 +1,74 @@
+import shutil
 import sqlite3
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
 from src.core.paths import app_dir
 
 
 class Database:
-    def __init__(self):
-        self.db_path = app_dir() / "data" / "tiktok.db"
-        self.db_path.parent.mkdir(exist_ok=True)
+    SCHEMA_VERSION = 1
+
+    def __init__(self, db_path=None):
+        self.db_path = Path(db_path) if db_path else app_dir() / "data" / "tiktok.db"
+        self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = Lock()
+        self._migration_backup = None
         self._init_db()
 
+    def schema_version(self) -> int:
+        with self.lock:
+            conn = self._get_connection()
+            version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            conn.close()
+            return version
+
+    def backup_before_migration(self):
+        return self._migration_backup
+
+    def _backup_existing_database(self):
+        if not self.db_path.exists() or self.db_path.stat().st_size == 0:
+            return None
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup = self.db_path.with_name(f"{self.db_path.stem}.before-migration-{stamp}{self.db_path.suffix}.bak")
+        shutil.copy2(self.db_path, backup)
+        return backup
+
+    def _needs_migration(self):
+        try:
+            conn = sqlite3.connect(str(self.db_path), timeout=5)
+            try:
+                version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+            finally:
+                conn.close()
+        except sqlite3.DatabaseError:
+            return True
+        return version != self.SCHEMA_VERSION
+
     def _get_connection(self):
-        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        # WAL + timeout: страницы статистики и загрузки пишут из разных потоков.
+        conn = sqlite3.connect(str(self.db_path), timeout=30, check_same_thread=False)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA foreign_keys = ON")
         return conn
 
     def _init_db(self):
+        existing = self.db_path.exists() and self.db_path.stat().st_size > 0
+        if existing and self._needs_migration():
+            self._migration_backup = self._backup_existing_database()
         with self.lock:
-            conn = self._get_connection()
-            cursor = conn.cursor()
+            try:
+                conn = self._get_connection()
+                cursor = conn.cursor()
+                cursor.execute("PRAGMA journal_mode = WAL")
+            except sqlite3.DatabaseError as error:
+                backup = self._migration_backup or self._backup_existing_database()
+                backup_name = str(backup) if backup else "не создан"
+                raise RuntimeError(
+                    f"corrupt database: {self.db_path}; backup: {backup_name}. "
+                    "Удалите или восстановите исходный файл вручную."
+                ) from error
 
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
@@ -86,6 +135,42 @@ class Database:
                 )
             """)
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS upload_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_id INTEGER,
+                    username TEXT NOT NULL,
+                    video_path TEXT,
+                    caption TEXT,
+                    status TEXT NOT NULL,
+                    error TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+            self._ensure_columns(cursor, "accounts", {
+                "cookies": "TEXT", "proxy_id": "INTEGER", "tag": "TEXT DEFAULT '---'",
+                "status": "TEXT DEFAULT 'active'", "videos_uploaded": "INTEGER DEFAULT 0",
+                "added_date": "TIMESTAMP",
+            })
+            self._ensure_columns(cursor, "proxies", {
+                "login": "TEXT", "password": "TEXT", "status": "TEXT DEFAULT 'alive'",
+                "response_time": "REAL", "tag": "TEXT DEFAULT '---'", "country": "TEXT DEFAULT 'UN'",
+                "created_at": "TIMESTAMP",
+            })
+            self._ensure_columns(cursor, "videos", {
+                "title": "TEXT", "description": "TEXT", "status": "TEXT DEFAULT 'pending'",
+                "account_id": "INTEGER", "uploaded_date": "TIMESTAMP", "added_date": "TIMESTAMP",
+            })
+            self._ensure_columns(cursor, "upload_log", {
+                "account_id": "INTEGER", "video_path": "TEXT", "caption": "TEXT",
+                "status": "TEXT", "error": "TEXT", "created_at": "TIMESTAMP",
+            })
+            cursor.execute("CREATE INDEX IF NOT EXISTS ix_accounts_tag ON accounts (tag, status)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS ix_upload_log_created ON upload_log (created_at)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS ix_videos_added ON videos (added_date)")
+            cursor.execute(f"PRAGMA user_version = {self.SCHEMA_VERSION}")
+
             default_settings = {
                 "show_splash": True,
             }
@@ -99,6 +184,13 @@ class Database:
 
             conn.commit()
             conn.close()
+
+    @staticmethod
+    def _ensure_columns(cursor, table, columns):
+        existing = {row[1] for row in cursor.execute(f"PRAGMA table_info({table})")}
+        for name, definition in columns.items():
+            if name not in existing:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {name} {definition}")
 
     def get(self, key, default=None):
         with self.lock:
@@ -281,17 +373,64 @@ class Database:
             return True
 
     def save_account(self, username: str, cookies_file: str = None, proxy_id: int = None, tag: str = "default") -> int:
+        """Добавляет аккаунт. Повторное добавление с тем же username обновляет
+        куки/тег вместо падения на UNIQUE-ограничении."""
         with self.lock:
             conn = self._get_connection()
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO accounts (username, cookies, proxy_id, tag)
-                VALUES (?, ?, ?, ?)
-            """, (username, cookies_file, proxy_id, tag))
-            account_id = cursor.lastrowid
+            cursor.execute("SELECT id FROM accounts WHERE username = ?", (username,))
+            row = cursor.fetchone()
+            if row:
+                account_id = row[0]
+                cursor.execute(
+                    "UPDATE accounts SET cookies = ?, tag = ?, status = 'active' WHERE id = ?",
+                    (cookies_file or "cookies", tag, account_id),
+                )
+            else:
+                cursor.execute("""
+                    INSERT INTO accounts (username, cookies, proxy_id, tag)
+                    VALUES (?, ?, ?, ?)
+                """, (username, cookies_file, proxy_id, tag))
+                account_id = cursor.lastrowid
             conn.commit()
             conn.close()
             return account_id
+
+    def get_account_by_username(self, username: str):
+        return self.fetchone("SELECT id, username, tag FROM accounts WHERE username = ?", (username,))
+
+    def get_accounts_by_tag(self, tag: str) -> list:
+        return [row[0] for row in self.fetchall(
+            "SELECT username FROM accounts WHERE tag = ? AND status = 'active' ORDER BY username", (tag,))]
+
+    def set_account_status(self, username: str, status: str):
+        self.execute("UPDATE accounts SET status = ? WHERE username = ?", (status, username))
+
+    def increment_account_uploads(self, usernames: list) -> int:
+        if not usernames:
+            return 0
+        placeholders = ",".join("?" * len(usernames))
+        self.execute(
+            f"UPDATE accounts SET videos_uploaded = COALESCE(videos_uploaded, 0) + 1 "
+            f"WHERE username IN ({placeholders})", usernames)
+        return len(usernames)
+
+    def log_upload(self, username: str, status: str, video_path: str = None,
+                   caption: str = None, error: str = None):
+        row = self.get_account_by_username(username)
+        self.execute(
+            "INSERT INTO upload_log (account_id, username, video_path, caption, status, error) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (row[0] if row else None, username, video_path, caption, status, error),
+        )
+
+    def get_upload_log(self, limit: int = 100) -> list:
+        return self.fetchall(
+            "SELECT username, video_path, caption, status, error, created_at FROM upload_log "
+            "ORDER BY id DESC LIMIT ?", (int(limit),))
+
+    def clear_upload_log(self):
+        self.execute("DELETE FROM upload_log")
 
     def get_accounts(self, limit: int = None, offset: int = 0) -> list:
         with self.lock:

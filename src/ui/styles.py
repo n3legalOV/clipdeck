@@ -13,6 +13,7 @@ DANGER = "#e5686b"
 from pathlib import Path
 
 CHEVRON = (Path(__file__).parent / "assets" / "chevron.svg").as_posix()
+CHEVRON_UP = (Path(__file__).parent / "assets" / "chevron-up.svg").as_posix()
 FONT_FAMILY = '"Segoe UI Variable Text", "Segoe UI", sans-serif'
 
 APP_STYLE = f"""
@@ -83,7 +84,19 @@ QPushButton#nav[active="true"] {{
     font-weight: 600;
 }}
 
-QLineEdit, QTextEdit, QPlainTextEdit, QComboBox {{
+QCheckBox {{ spacing: 8px; }}
+QCheckBox::indicator {{
+    width: 16px;
+    height: 16px;
+    border: 1px solid {BORDER_STRONG};
+    border-radius: 4px;
+    background: {SURFACE};
+}}
+QCheckBox::indicator:hover {{ border-color: {ACCENT}; }}
+QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
+QCheckBox:disabled {{ color: {FAINT}; }}
+
+QLineEdit, QTextEdit, QPlainTextEdit, QComboBox, QSpinBox {{
     background: {SURFACE};
     border: 1px solid {BORDER};
     border-radius: 6px;
@@ -92,9 +105,26 @@ QLineEdit, QTextEdit, QPlainTextEdit, QComboBox {{
     selection-background-color: {ACCENT};
     selection-color: {BG};
 }}
-QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QComboBox:hover {{ border-color: {BORDER_STRONG}; }}
-QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus {{ border-color: {ACCENT}; }}
-QLineEdit:disabled {{ color: {FAINT}; }}
+QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QComboBox:hover, QSpinBox:hover {{ border-color: {BORDER_STRONG}; }}
+QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QComboBox:focus, QSpinBox:focus {{ border-color: {ACCENT}; }}
+QLineEdit:disabled, QSpinBox:disabled {{ color: {FAINT}; }}
+QSpinBox {{ padding-right: 26px; min-height: 18px; }}
+QSpinBox::up-button, QSpinBox::down-button {{
+    background: transparent;
+    border: none;
+    width: 22px;
+}}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {{ background: {SURFACE_2}; }}
+QSpinBox::up-arrow {{
+    image: url({CHEVRON_UP});
+    width: 10px;
+    height: 10px;
+}}
+QSpinBox::down-arrow {{
+    image: url({CHEVRON});
+    width: 10px;
+    height: 10px;
+}}
 QPlainTextEdit#log {{
     font-family: Consolas, "Cascadia Mono", monospace;
     font-size: 12px;
